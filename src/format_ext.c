@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * extfs formatting
- * Copyright © 2019-2020 Pete Batard <pete@akeo.ie>
+ * Copyright © 2019-2024 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -178,7 +178,7 @@ const char* error_message(errcode_t error_code)
 		if ((error_code > EXT2_ET_BASE) && error_code < (EXT2_ET_BASE + 1000)) {
 			static_sprintf(error_string, "Unknown ext2fs error %ld (EXT2_ET_BASE + %ld)", error_code, error_code - EXT2_ET_BASE);
 		} else {
-			SetLastError((FormatStatus == 0) ? (ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | (error_code & 0xFFFF)) : FormatStatus);
+			SetLastError((ErrorStatus == 0) ? RUFUS_ERROR(error_code & 0xFFFF) : ErrorStatus);
 			static_sprintf(error_string, "%s", WindowsErrorString());
 		}
 		return error_string;
@@ -196,7 +196,7 @@ errcode_t ext2fs_print_progress(int64_t cur_value, int64_t max_value)
 		last_value = cur_value;
 		uprintfs("+");
 	}
-	return IS_ERROR(FormatStatus) ? EXT2_ET_CANCEL_REQUESTED : 0;
+	return IS_ERROR(ErrorStatus) ? EXT2_ET_CANCEL_REQUESTED : 0;
 }
 
 const char* GetExtFsLabel(DWORD DriveIndex, uint64_t PartitionOffset)
@@ -212,6 +212,7 @@ const char* GetExtFsLabel(DWORD DriveIndex, uint64_t PartitionOffset)
 	r = ext2fs_open(volume_name, EXT2_FLAG_SKIP_MMP, 0, 0, manager, &ext2fs);
 	free(volume_name);
 	if (r == 0) {
+		assert(ext2fs != NULL);
 		strncpy(label, ext2fs->super->s_volume_name, EXT2_LABEL_LEN);
 		label[EXT2_LABEL_LEN] = 0;
 	}
@@ -222,7 +223,7 @@ const char* GetExtFsLabel(DWORD DriveIndex, uint64_t PartitionOffset)
 
 #define TEST_IMG_PATH               "\\??\\C:\\tmp\\disk.img"
 #define TEST_IMG_SIZE               4000		// Size in MB
-#define SET_EXT2_FORMAT_ERROR(x)    if (!IS_ERROR(FormatStatus)) FormatStatus = ext2_last_winerror(x)
+#define SET_EXT2_FORMAT_ERROR(x)    if (!IS_ERROR(ErrorStatus)) ErrorStatus = ext2_last_winerror(x)
 
 BOOL FormatExtFs(DWORD DriveIndex, uint64_t PartitionOffset, DWORD BlockSize, LPCSTR FSName, LPCSTR Label, DWORD Flags)
 {
@@ -272,7 +273,7 @@ BOOL FormatExtFs(DWORD DriveIndex, uint64_t PartitionOffset, DWORD BlockSize, LP
 	volume_name = GetExtPartitionName(DriveIndex, PartitionOffset);
 #endif
 	if ((volume_name == NULL) | (strlen(FSName) != 4) || (strncmp(FSName, "ext", 3) != 0)) {
-		FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | ERROR_INVALID_PARAMETER;
+		ErrorStatus = RUFUS_ERROR(ERROR_INVALID_PARAMETER);
 		goto out;
 	}
 	if (strchr(volume_name, ' ') != NULL)
@@ -405,14 +406,14 @@ BOOL FormatExtFs(DWORD DriveIndex, uint64_t PartitionOffset, DWORD BlockSize, LP
 	// Create root and lost+found dirs
 	r = ext2fs_mkdir(ext2fs, EXT2_ROOT_INO, EXT2_ROOT_INO, 0);
 	if (r != 0) {
-		SET_EXT2_FORMAT_ERROR(ERROR_DIR_NOT_ROOT);
+		SET_EXT2_FORMAT_ERROR(ERROR_FILE_CORRUPT);
 		uprintf("Failed to create %s root dir: %s", FSName, error_message(r));
 		goto out;
 	}
 	ext2fs->umask = 077;
 	r = ext2fs_mkdir(ext2fs, EXT2_ROOT_INO, 0, "lost+found");
 	if (r != 0) {
-		SET_EXT2_FORMAT_ERROR(ERROR_DIR_NOT_ROOT);
+		SET_EXT2_FORMAT_ERROR(ERROR_FILE_CORRUPT);
 		uprintf("Failed to create %s 'lost+found' dir: %s", FSName, error_message(r));
 		goto out;
 	}
@@ -460,13 +461,19 @@ BOOL FormatExtFs(DWORD DriveIndex, uint64_t PartitionOffset, DWORD BlockSize, LP
 		int written = 0, fsize = sizeof(data) - 1;
 		ext2_file_t ext2fd;
 		ext2_ino_t inode_id;
-		uint32_t ctime = (uint32_t)time(0);
+		time_t ctime = time(NULL);
 		struct ext2_inode inode = { 0 };
+		// Don't care about the Y2K38 problem of ext2/ext3 for a 'persistence.conf' timestamp
+		if (ctime > UINT32_MAX)
+			ctime = UINT32_MAX;
 		inode.i_mode = 0100644;
 		inode.i_links_count = 1;
-		inode.i_atime = ctime;
-		inode.i_ctime = ctime;
-		inode.i_mtime = ctime;
+		// coverity[store_truncates_time_t]
+		inode.i_atime = (uint32_t)ctime;
+		// coverity[store_truncates_time_t]
+		inode.i_ctime = (uint32_t)ctime;
+		// coverity[store_truncates_time_t]
+		inode.i_mtime = (uint32_t)ctime;
 		inode.i_size = fsize;
 
 		ext2fs_namei(ext2fs, EXT2_ROOT_INO, EXT2_ROOT_INO, name, &inode_id);
@@ -484,13 +491,15 @@ BOOL FormatExtFs(DWORD DriveIndex, uint64_t PartitionOffset, DWORD BlockSize, LP
 
 	// Finally we can call close() to get the file system gets created
 	r = ext2fs_close(ext2fs);
-	if (r != 0) {
+	if (r == 0) {
+		// Make sure ext2fs isn't freed twice
+		ext2fs = NULL;
+	} else {
 		SET_EXT2_FORMAT_ERROR(ERROR_WRITE_FAULT);
 		uprintf("Could not create %s volume: %s", FSName, error_message(r));
 		goto out;
 	}
 	UpdateProgressWithInfo(OP_FORMAT, MSG_217, 100, 100);
-	uprintf("Done");
 	ret = TRUE;
 
 out:

@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Virtual Disk Handling functions
- * Copyright © 2013-2016 Pete Batard <pete@akeo.ie>
+ * Copyright © 2013-2024 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -17,125 +17,34 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+// MinGW includes virdisk.h in windows.h, but we we don't want that
+// because we must apply a delay-loading workaround, and that workaround
+// has to apply between the winnt.h include and the virdisk.h include.
+// So we define _INC_VIRTDISK, to prevent the virdisk.h include in
+// windows.h, and then take care of the workaround (and virtdisk.h
+// include) in vhd.h.
+#define _INC_VIRTDISK
 #include <windows.h>
+#undef _INC_VIRTDISK
+#include <windowsx.h>
 #include <stdlib.h>
 #include <io.h>
 #include <rpc.h>
 #include <time.h>
 
 #include "rufus.h"
+#include "ui.h"
+#include "vhd.h"
 #include "missing.h"
 #include "resource.h"
+#include "settings.h"
 #include "msapi_utf8.h"
 
 #include "drive.h"
 #include "registry.h"
 #include "bled/bled.h"
 
-#define VHD_FOOTER_COOKIE					{ 'c', 'o', 'n', 'e', 'c', 't', 'i', 'x' }
-
-#define VHD_FOOTER_FEATURES_NONE			0x00000000
-#define VHD_FOOTER_FEATURES_TEMPORARY		0x00000001
-#define VHD_FOOTER_FEATURES_RESERVED		0x00000002
-
-#define VHD_FOOTER_FILE_FORMAT_V1_0			0x00010000
-
-#define VHD_FOOTER_DATA_OFFSET_FIXED_DISK	0xFFFFFFFFFFFFFFFFULL
-
-#define VHD_FOOTER_CREATOR_HOST_OS_WINDOWS	{ 'W', 'i', '2', 'k' }
-#define VHD_FOOTER_CREATOR_HOST_OS_MAC		{ 'M', 'a', 'c', ' ' }
-
-#define VHD_FOOTER_TYPE_FIXED_HARD_DISK		0x00000002
-#define VHD_FOOTER_TYPE_DYNAMIC_HARD_DISK	0x00000003
-#define VHD_FOOTER_TYPE_DIFFER_HARD_DISK	0x00000004
-
-#define WIM_MAGIC							0x0000004D4957534DULL	// "MSWIM\0\0\0"
-#define WIM_HAS_API_EXTRACT					1
-#define WIM_HAS_7Z_EXTRACT					2
-#define WIM_HAS_API_APPLY					4
-#define WIM_HAS_EXTRACT(r)					(r & (WIM_HAS_API_EXTRACT|WIM_HAS_7Z_EXTRACT))
-
-#define SECONDS_SINCE_JAN_1ST_2000			946684800
-
-#define INVALID_CALLBACK_VALUE				0xFFFFFFFF
-
-#define WIM_FLAG_RESERVED					0x00000001
-#define WIM_FLAG_VERIFY						0x00000002
-#define WIM_FLAG_INDEX						0x00000004
-#define WIM_FLAG_NO_APPLY					0x00000008
-#define WIM_FLAG_NO_DIRACL					0x00000010
-#define WIM_FLAG_NO_FILEACL					0x00000020
-#define WIM_FLAG_SHARE_WRITE				0x00000040
-#define WIM_FLAG_FILEINFO					0x00000080
-#define WIM_FLAG_NO_RP_FIX					0x00000100
-
-// Bitmask for the kind of progress we want to report in the WIM progress callback
-#define WIM_REPORT_PROGRESS					0x00000001
-#define WIM_REPORT_PROCESS					0x00000002
-#define WIM_REPORT_FILEINFO					0x00000004
-
-// From https://docs.microsoft.com/en-us/previous-versions/msdn10/dd834960(v=msdn.10)
-// as well as https://msfn.org/board/topic/150700-wimgapi-wimmountimage-progressbar/
-enum WIMMessage {
-	WIM_MSG = WM_APP + 0x1476,
-	WIM_MSG_TEXT,
-	WIM_MSG_PROGRESS,	// Indicates an update in the progress of an image application.
-	WIM_MSG_PROCESS,	// Enables the caller to prevent a file or a directory from being captured or applied.
-	WIM_MSG_SCANNING,	// Indicates that volume information is being gathered during an image capture.
-	WIM_MSG_SETRANGE,	// Indicates the number of files that will be captured or applied.
-	WIM_MSG_SETPOS,		// Indicates the number of files that have been captured or applied.
-	WIM_MSG_STEPIT,		// Indicates that a file has been either captured or applied.
-	WIM_MSG_COMPRESS,	// Enables the caller to prevent a file resource from being compressed during a capture.
-	WIM_MSG_ERROR,		// Alerts the caller that an error has occurred while capturing or applying an image.
-	WIM_MSG_ALIGNMENT,	// Enables the caller to align a file resource on a particular alignment boundary.
-	WIM_MSG_RETRY,		// Sent when the file is being reapplied because of a network timeout.
-	WIM_MSG_SPLIT,		// Enables the caller to align a file resource on a particular alignment boundary.
-	WIM_MSG_FILEINFO,	// Used in conjunction with WimApplyImages()'s WIM_FLAG_FILEINFO flag to provide detailed file info.
-	WIM_MSG_INFO,		// Sent when an info message is available.
-	WIM_MSG_WARNING,	// Sent when a warning message is available.
-	WIM_MSG_CHK_PROCESS,
-	WIM_MSG_SUCCESS     = 0,
-	WIM_MSG_ABORT_IMAGE = -1
-};
-
-/*
- * VHD Fixed HD footer (Big Endian)
- * http://download.microsoft.com/download/f/f/e/ffef50a5-07dd-4cf8-aaa3-442c0673a029/Virtual%20Hard%20Disk%20Format%20Spec_10_18_06.doc
- * NB: If a dymamic implementation is needed, check the GPL v3 compatible C++ implementation from:
- * https://sourceforge.net/p/urbackup/backend/ci/master/tree/fsimageplugin/
- */
-#pragma pack(push, 1)
-typedef struct vhd_footer {
-	char		cookie[8];
-	uint32_t	features;
-	uint32_t	file_format_version;
-	uint64_t	data_offset;
-	uint32_t	timestamp;
-	char		creator_app[4];
-	uint32_t	creator_version;
-	char		creator_host_os[4];
-	uint64_t	original_size;
-	uint64_t	current_size;
-	union {
-		uint32_t	geometry;
-		struct {
-			uint16_t	cylinders;
-			uint8_t		heads;
-			uint8_t		sectors;
-		} chs;
-	} disk_geometry;
-	uint32_t	disk_type;
-	uint32_t	checksum;
-	uuid_t		unique_id;
-	uint8_t		saved_state;
-	uint8_t		reserved[427];
-} vhd_footer;
-#pragma pack(pop)
-
 // WIM API Prototypes
-#define WIM_GENERIC_READ            GENERIC_READ
-#define WIM_OPEN_EXISTING           OPEN_EXISTING
-#define WIM_UNDOCUMENTED_BULLSHIT   0x20000000
 PF_TYPE_DECL(WINAPI, HANDLE, WIMCreateFile, (PWSTR, DWORD, DWORD, DWORD, DWORD, PDWORD));
 PF_TYPE_DECL(WINAPI, BOOL, WIMSetTemporaryPath, (HANDLE, PWSTR));
 PF_TYPE_DECL(WINAPI, HANDLE, WIMLoadImage, (HANDLE, DWORD));
@@ -147,133 +56,44 @@ PF_TYPE_DECL(WINAPI, BOOL, WIMGetImageInformation, (HANDLE, PVOID, PDWORD));
 PF_TYPE_DECL(WINAPI, BOOL, WIMCloseHandle, (HANDLE));
 PF_TYPE_DECL(WINAPI, DWORD, WIMRegisterMessageCallback, (HANDLE, FARPROC, PVOID));
 PF_TYPE_DECL(WINAPI, DWORD, WIMUnregisterMessageCallback, (HANDLE, FARPROC));
-PF_TYPE_DECL(RPC_ENTRY, RPC_STATUS, UuidCreate, (UUID __RPC_FAR*));
+
+typedef struct {
+	int index;
+	BOOL commit;
+	const char* image;
+	const char* dst;
+} mount_params_t;
 
 uint32_t wim_nb_files, wim_proc_files, wim_extra_files;
 HANDLE wim_thread = NULL;
 extern int default_thread_priority;
-extern BOOL ignore_boot_marker;
+extern char* save_image_type;
+extern BOOL ignore_boot_marker, has_ffu_support;
+extern RUFUS_DRIVE rufus_drive[MAX_DRIVES];
+extern HANDLE format_thread;
 
 static uint8_t wim_flags = 0;
 static uint32_t progress_report_mask;
 static uint64_t progress_offset = 0, progress_total = 100;
 static wchar_t wmount_path[MAX_PATH] = { 0 }, wmount_track[MAX_PATH] = { 0 };
-static char sevenzip_path[MAX_PATH];
-static const char conectix_str[] = VHD_FOOTER_COOKIE;
+static char sevenzip_path[MAX_PATH], physical_path[128] = "";
+static int progress_op = OP_FILE_COPY, progress_msg = MSG_267;
 static BOOL count_files;
-// Apply/Mount image functionality
-static const char *_image, *_dst;
-static int _index, progress_op = OP_FILE_COPY, progress_msg = MSG_267;
+static HANDLE mounted_handle = INVALID_HANDLE_VALUE;
 
 static BOOL Get7ZipPath(void)
 {
-	if ( (GetRegistryKeyStr(REGKEY_HKCU, "7-Zip\\Path", sevenzip_path, sizeof(sevenzip_path)))
-	  || (GetRegistryKeyStr(REGKEY_HKLM, "7-Zip\\Path", sevenzip_path, sizeof(sevenzip_path))) ) {
+	if ( (GetRegistryKeyStr(REGKEY_HKCU, "Software\\7-Zip\\Path", sevenzip_path, sizeof(sevenzip_path)))
+	  || (GetRegistryKeyStr(REGKEY_HKLM, "Software\\7-Zip\\Path", sevenzip_path, sizeof(sevenzip_path))) ) {
 		static_strcat(sevenzip_path, "\\7z.exe");
 		return (_accessU(sevenzip_path, 0) != -1);
 	}
 	return FALSE;
 }
 
-BOOL AppendVHDFooter(const char* vhd_path)
-{
-	const char creator_os[4] = VHD_FOOTER_CREATOR_HOST_OS_WINDOWS;
-	const char creator_app[4] = { 'r', 'u', 'f', 's' };
-	BOOL r = FALSE;
-	DWORD size;
-	LARGE_INTEGER li;
-	HANDLE handle = INVALID_HANDLE_VALUE;
-	vhd_footer* footer = NULL;
-	uint64_t totalSectors;
-	uint16_t cylinders = 0;
-	uint8_t heads, sectorsPerTrack;
-	uint32_t cylinderTimesHeads;
-	uint32_t checksum;
-	size_t i;
-
-	PF_INIT(UuidCreate, Rpcrt4);
-	handle = CreateFileU(vhd_path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL,
-		OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-	li.QuadPart = 0;
-	if ((handle == INVALID_HANDLE_VALUE) || (!SetFilePointerEx(handle, li, &li, FILE_END))) {
-		uprintf("Could not open image '%s': %s", vhd_path, WindowsErrorString());
-		goto out;
-	}
-	footer = (vhd_footer*)calloc(1, sizeof(vhd_footer));
-	if (footer == NULL) {
-		uprintf("Could not allocate VHD footer");
-		goto out;
-	}
-
-	memcpy(footer->cookie, conectix_str, sizeof(footer->cookie));
-	footer->features = bswap_uint32(VHD_FOOTER_FEATURES_RESERVED);
-	footer->file_format_version = bswap_uint32(VHD_FOOTER_FILE_FORMAT_V1_0);
-	footer->data_offset = bswap_uint64(VHD_FOOTER_DATA_OFFSET_FIXED_DISK);
-	footer->timestamp = bswap_uint32((uint32_t)(_time64(NULL) - SECONDS_SINCE_JAN_1ST_2000));
-	memcpy(footer->creator_app, creator_app, sizeof(creator_app));
-	footer->creator_version = bswap_uint32((rufus_version[0]<<16)|rufus_version[1]);
-	memcpy(footer->creator_host_os, creator_os, sizeof(creator_os));
-	footer->original_size = bswap_uint64(li.QuadPart);
-	footer->current_size = footer->original_size;
-	footer->disk_type = bswap_uint32(VHD_FOOTER_TYPE_FIXED_HARD_DISK);
-	if ((pfUuidCreate == NULL) || (pfUuidCreate(&footer->unique_id) != RPC_S_OK))
-		uprintf("Warning: could not set VHD UUID");
-
-	// Compute CHS, as per the VHD specs
-	totalSectors = li.QuadPart / 512;
-	if (totalSectors > 65535 * 16 * 255) {
-		totalSectors = 65535 * 16 * 255;
-	}
-
-	if (totalSectors >= 65535 * 16 * 63) {
-		sectorsPerTrack = 255;
-		heads = 16;
-		cylinderTimesHeads = (uint32_t)(totalSectors / sectorsPerTrack);
-	} else {
-		sectorsPerTrack = 17;
-		cylinderTimesHeads = (uint32_t)(totalSectors / sectorsPerTrack);
-
-		heads = (cylinderTimesHeads + 1023) / 1024;
-
-		if (heads < 4) {
-			heads = 4;
-		}
-		if (cylinderTimesHeads >= ((uint32_t)heads * 1024) || heads > 16) {
-			sectorsPerTrack = 31;
-			heads = 16;
-			cylinderTimesHeads = (uint32_t)(totalSectors / sectorsPerTrack);
-		}
-		if (cylinderTimesHeads >= ((uint32_t)heads * 1024)) {
-			sectorsPerTrack = 63;
-			heads = 16;
-			cylinderTimesHeads = (uint32_t)(totalSectors / sectorsPerTrack);
-		}
-	}
-	cylinders = cylinderTimesHeads / heads;
-	footer->disk_geometry.chs.cylinders = bswap_uint16(cylinders);
-	footer->disk_geometry.chs.heads = heads;
-	footer->disk_geometry.chs.sectors = sectorsPerTrack;
-
-	// Compute the VHD footer checksum
-	for (checksum=0, i=0; i<sizeof(vhd_footer); i++)
-		checksum += ((uint8_t*)footer)[i];
-	footer->checksum = bswap_uint32(~checksum);
-
-	if (!WriteFileWithRetry(handle, footer, sizeof(vhd_footer), &size, WRITE_RETRIES)) {
-		uprintf("Could not write VHD footer: %s", WindowsErrorString());
-		goto out;
-	}
-	r = TRUE;
-
-out:
-	safe_free(footer);
-	safe_closehandle(handle);
-	return r;
-}
-
 typedef struct {
 	const char* ext;
-	bled_compression_type type;
+	uint8_t type;
 } comp_assoc;
 
 static comp_assoc file_assoc[] = {
@@ -284,39 +104,86 @@ static comp_assoc file_assoc[] = {
 	{ ".bz2", BLED_COMPRESSION_BZIP2 },
 	{ ".xz", BLED_COMPRESSION_XZ },
 	{ ".vtsi", BLED_COMPRESSION_VTSI },
+	{ ".zst", BLED_COMPRESSION_ZSTD },
+	{ ".ffu", BLED_COMPRESSION_MAX },
+	{ ".vhd", BLED_COMPRESSION_MAX + 1 },
+	{ ".vhdx", BLED_COMPRESSION_MAX + 2 },
 };
 
-// For now we consider that an image that matches a known extension is bootable
-#define MBR_SIZE 512	// Might need to review this once we see bootable 4k systems
-BOOL IsCompressedBootableImage(const char* path)
+// Look for a boot marker in the MBR area of the image
+static int8_t IsCompressedBootableImage(const char* path)
 {
-	char *p;
+	char *ext = NULL, *physical_disk = NULL;
 	unsigned char *buf = NULL;
 	int i;
-	BOOL r = FALSE;
-	int64_t dc;
+	FILE* fd = NULL;
+	BOOL r = 0;
+	int64_t dc = 0;
 
 	img_report.compression_type = BLED_COMPRESSION_NONE;
-	for (p = (char*)&path[strlen(path)-1]; (*p != '.') && (p != path); p--);
+	if (safe_strlen(path) > 4)
+		for (ext = (char*)&path[safe_strlen(path) - 1]; (*ext != '.') && (ext != path); ext--);
 
-	if (p == path)
-		return FALSE;
-
-	for (i = 0; i<ARRAYSIZE(file_assoc); i++) {
-		if (strcmp(p, file_assoc[i].ext) == 0) {
+	for (i = 0; i < ARRAYSIZE(file_assoc); i++) {
+		if (safe_stricmp(ext, file_assoc[i].ext) == 0) {
 			img_report.compression_type = file_assoc[i].type;
 			buf = malloc(MBR_SIZE);
 			if (buf == NULL)
-				return FALSE;
-			FormatStatus = 0;
-			bled_init(_uprintf, NULL, NULL, NULL, NULL, &FormatStatus);
-			dc = bled_uncompress_to_buffer(path, (char*)buf, MBR_SIZE, file_assoc[i].type);
-			bled_exit();
+				return 0;
+			ErrorStatus = 0;
+			if (img_report.compression_type < BLED_COMPRESSION_MAX) {
+				bled_init(0, uprintf, NULL, NULL, NULL, NULL, &ErrorStatus);
+				dc = bled_uncompress_to_buffer(path, (char*)buf, MBR_SIZE, file_assoc[i].type);
+				bled_exit();
+			} else if (img_report.compression_type == BLED_COMPRESSION_MAX) {
+				// Dism, through FfuProvider.dll, can mount a .ffu as a physicaldrive, which we
+				// could then use to poke the MBR as we do for VHD... Except Microsoft did design
+				// dism to FAIL AND EXIT, after mounting the ffu as a virtual drive, if it doesn't
+				// find something that looks like Windows at the specified image index... which it
+				// usually won't in our case. So, curse Microsoft and their incredible short-
+				// sightedness (or, most likely in this case, intentional malice, by BREACHING the
+				// OS contract to keep useful disk APIs for their usage, and their usage only).
+				// Then again, considering that .ffu's are GPT based, the marker should always be
+				// present, so just check for the FFU signature and pretend there's a marker then.
+				if (has_ffu_support) {
+					fd = fopenU(path, "rb");
+					if (fd != NULL) {
+						img_report.is_vhd = TRUE;
+						dc = fread(buf, 1, MBR_SIZE, fd);
+						fclose(fd);
+						// The signature may not be constant, but since the only game in town to
+						// create FFU is dism, and dism appears to use "SignedImage " always,.we
+						// might as well use this to our advantage.
+						if (strncmp(&buf[4], "SignedImage ", 12) == 0) {
+							// At this stage, the buffer is only used for marker validation.
+							buf[0x1FE] = 0x55;
+							buf[0x1FF] = 0xAA;
+						}
+					} else
+						uprintf("Could not open %s: %d", path, errno);
+				} else {
+					uprintf("  An FFU image was selected, but this system does not have FFU support!");
+				}
+			} else {
+				physical_disk = VhdMountImage(path);
+				if (physical_disk != NULL) {
+					img_report.is_vhd = TRUE;
+					fd = fopenU(physical_disk, "rb");
+					if (fd != NULL) {
+						dc = fread(buf, 1, MBR_SIZE, fd);
+						fclose(fd);
+					}
+				}
+				VhdUnmountImage();
+			}
 			if (dc != MBR_SIZE) {
 				free(buf);
 				return FALSE;
 			}
-			r = (buf[0x1FE] == 0x55) && (buf[0x1FF] == 0xAA);
+			if ((buf[0x1FE] == 0x55) && (buf[0x1FF] == 0xAA))
+				r = 1;
+			else if (ignore_boot_marker)
+				r = 2;
 			free(buf);
 			return r;
 		}
@@ -326,23 +193,20 @@ BOOL IsCompressedBootableImage(const char* path)
 }
 
 // 0: non-bootable, 1: bootable, 2: forced bootable
-uint8_t IsBootableImage(const char* path)
+int8_t IsBootableImage(const char* path)
 {
 	HANDLE handle = INVALID_HANDLE_VALUE;
 	LARGE_INTEGER liImageSize;
-	vhd_footer* footer = NULL;
 	DWORD size;
-	size_t i;
-	uint32_t checksum, old_checksum;
 	uint64_t wim_magic = 0;
 	LARGE_INTEGER ptr = { 0 };
-	uint8_t is_bootable_img = 0;
+	int8_t is_bootable_img;
 
 	uprintf("Disk image analysis:");
-	handle = CreateFileU(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-		OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	handle = CreateFileU(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (handle == INVALID_HANDLE_VALUE) {
 		uprintf("  Could not open image '%s'", path);
+		is_bootable_img = -1;
 		goto out;
 	}
 
@@ -352,6 +216,7 @@ uint8_t IsBootableImage(const char* path)
 
 	if (!GetFileSizeEx(handle, &liImageSize)) {
 		uprintf("  Could not get image size: %s", WindowsErrorString());
+		is_bootable_img = -2;
 		goto out;
 	}
 	img_report.image_size = (uint64_t)liImageSize.QuadPart;
@@ -361,39 +226,7 @@ uint8_t IsBootableImage(const char* path)
 	if (img_report.is_windows_img)
 		goto out;
 
-	size = sizeof(vhd_footer);
-	if ((img_report.compression_type == BLED_COMPRESSION_NONE) && (img_report.image_size >= (512 + size))) {
-		footer = (vhd_footer*)malloc(size);
-		ptr.QuadPart = img_report.image_size - size;
-		if ( (footer == NULL) || (!SetFilePointerEx(handle, ptr, NULL, FILE_BEGIN)) ||
-			 (!ReadFile(handle, footer, size, &size, NULL)) || (size != sizeof(vhd_footer)) ) {
-			uprintf("  Could not read VHD footer");
-			goto out;
-		}
-		if (memcmp(footer->cookie, conectix_str, sizeof(footer->cookie)) == 0) {
-			img_report.image_size -= sizeof(vhd_footer);
-			if ( (bswap_uint32(footer->file_format_version) != VHD_FOOTER_FILE_FORMAT_V1_0)
-			  || (bswap_uint32(footer->disk_type) != VHD_FOOTER_TYPE_FIXED_HARD_DISK)) {
-				uprintf("  Unsupported type of VHD image");
-				is_bootable_img = 0;
-				goto out;
-			}
-			// Might as well validate the checksum while we're at it
-			old_checksum = bswap_uint32(footer->checksum);
-			footer->checksum = 0;
-			for (checksum=0, i=0; i<sizeof(vhd_footer); i++)
-				checksum += ((uint8_t*)footer)[i];
-			checksum = ~checksum;
-			if (checksum != old_checksum)
-				uprintf("  Warning: VHD footer seems corrupted (checksum: %04X, expected: %04X)", old_checksum, checksum);
-			// Need to remove the footer from our payload
-			uprintf("  Image is a Fixed Hard Disk VHD file");
-			img_report.is_vhd = TRUE;
-		}
-	}
-
 out:
-	safe_free(footer);
 	safe_closehandle(handle);
 	return is_bootable_img;
 }
@@ -435,7 +268,7 @@ DWORD WINAPI WimProgressCallback(DWORD dwMsgId, WPARAM wParam, LPARAM lParam, PV
 			UpdateProgressWithInfo(progress_op, progress_msg, wim_proc_files, wim_nb_files);
 		}
 		// Halt on error
-		if (IS_ERROR(FormatStatus)) {
+		if (IS_ERROR(ErrorStatus)) {
 			pbCancel = (PBOOL)lParam;
 			*pbCancel = TRUE;
 			break;
@@ -464,11 +297,11 @@ DWORD WINAPI WimProgressCallback(DWORD dwMsgId, WPARAM wParam, LPARAM lParam, PV
 	case WIM_MSG_ERROR:
 		if (level == NULL) level = "error";
 		SetLastError((DWORD)lParam);
-		uprintf("WIM processing %s: %S [err = %d]\n", level, (PWSTR)wParam, WindowsErrorString());
+		uprintf("WIM processing %s: %S [%s]\n", level, (PWSTR)wParam, WindowsErrorString());
 		break;
 	}
 
-	return IS_ERROR(FormatStatus) ? WIM_MSG_ABORT_IMAGE : WIM_MSG_SUCCESS;
+	return IS_ERROR(ErrorStatus) ? WIM_MSG_ABORT_IMAGE : WIM_MSG_SUCCESS;
 }
 
 // Find out if we have any way to extract/apply WIM files on this platform
@@ -515,15 +348,20 @@ static DWORD WINAPI WimMountImageThread(LPVOID param)
 {
 	BOOL r = FALSE;
 	wconvert(temp_dir);
-	wchar_t* wimage = utf8_to_wchar(_image);
+	mount_params_t* mp = (mount_params_t*)param;
+	wchar_t* wimage = utf8_to_wchar(mp->image);
 
 	PF_INIT_OR_OUT(WIMRegisterMessageCallback, Wimgapi);
 	PF_INIT_OR_OUT(WIMMountImage, Wimgapi);
+	PF_INIT_OR_OUT(WIMUnmountImage, Wimgapi);
 	PF_INIT_OR_OUT(WIMUnregisterMessageCallback, Wimgapi);
 
 	if (wmount_path[0] != 0) {
-		uprintf("WimMountImage: An image is already mounted");
-		goto out;
+		uprintf("WimMountImage: An image is already mounted. Trying to unmount it...");
+		if (pfWIMUnmountImage(wmount_path, wimage, mp->index, FALSE))
+			uprintf("WimMountImage: Successfully unmounted existing image..");
+		else
+			goto out;
 	}
 	if (GetTempFileNameW(wtemp_dir, L"Ruf", 0, wmount_path) == 0) {
 		uprintf("WimMountImage: Can not generate mount directory: %s", WindowsErrorString());
@@ -546,7 +384,7 @@ static DWORD WINAPI WimMountImageThread(LPVOID param)
 
 	progress_report_mask = WIM_REPORT_PROGRESS;
 	progress_op = OP_PATCH;
-	progress_msg = MSG_324;
+	progress_msg = MSG_325;
 	progress_offset = 1;
 	progress_total = PATCH_PROGRESS_TOTAL;
 	if (pfWIMRegisterMessageCallback(NULL, (FARPROC)WimProgressCallback, NULL) == INVALID_CALLBACK_VALUE) {
@@ -554,15 +392,25 @@ static DWORD WINAPI WimMountImageThread(LPVOID param)
 		goto out;
 	}
 
-	r = pfWIMMountImage(wmount_path, wimage, _index, wmount_track);
+	r = pfWIMMountImage(wmount_path, wimage, mp->index, wmount_track);
 	pfWIMUnregisterMessageCallback(NULL, (FARPROC)WimProgressCallback);
 	if (!r) {
-		uprintf("Could not mount '%S [%d]' on '%S': %s", wimage, _index, wmount_path, WindowsErrorString());
+		uprintf("Could not mount '%S [%d]' on '%S': %s", wimage, mp->index, wmount_path, WindowsErrorString());
 		goto out;
 	}
-	uprintf("mounted '%S [%d]' on '%S'", wimage, _index, wmount_path);
+	uprintf("Mounted '%S [%d]' on '%S'", wimage, mp->index, wmount_path);
 
 out:
+	if (!r) {
+		if (wmount_track[0] != 0) {
+			RemoveDirectoryW(wmount_track);
+			wmount_track[0] = 0;
+		}
+		if (wmount_path[0] != 0) {
+			RemoveDirectoryW(wmount_path);
+			wmount_path[0] = 0;
+		}
+	}
 	wfree(temp_dir);
 	safe_free(wimage);
 	ExitThread((DWORD)r);
@@ -572,11 +420,23 @@ out:
 // Returned path must be freed by the caller.
 char* WimMountImage(const char* image, int index)
 {
+	char* mount_path = NULL;
 	DWORD dw = 0;
-	_image = image;
-	_index = index;
+	mount_params_t mp = { 0 };
+	mp.image = image;
+	mp.index = index;
 
-	wim_thread = CreateThread(NULL, 0, WimMountImageThread, NULL, 0, NULL);
+	// Try to unmount an existing stale image, if there is any
+	mount_path = WimGetExistingMountPoint(image, index);
+	if (mount_path != NULL) {
+		uprintf("WARNING: Found stale '%s [%d]' image mounted on '%s' - Attempting to unmount it...",
+			image, index, mount_path);
+		utf8_to_wchar_no_alloc(mount_path, wmount_path, ARRAYSIZE(wmount_path));
+		wmount_track[0] = 0;
+		WimUnmountImage(image, index, FALSE);
+	}
+
+	wim_thread = CreateThread(NULL, 0, WimMountImageThread, &mp, 0, NULL);
 	if (wim_thread == NULL) {
 		uprintf("Unable to start mount-image thread");
 		return NULL;
@@ -592,7 +452,8 @@ char* WimMountImage(const char* image, int index)
 static DWORD WINAPI WimUnmountImageThread(LPVOID param)
 {
 	BOOL r = FALSE;
-	wchar_t* wimage = utf8_to_wchar(_image);
+	mount_params_t* mp = (mount_params_t*)param;
+	wchar_t* wimage = utf8_to_wchar(mp->image);
 
 	PF_INIT_OR_OUT(WIMRegisterMessageCallback, Wimgapi);
 	PF_INIT_OR_OUT(WIMUnmountImage, Wimgapi);
@@ -605,7 +466,7 @@ static DWORD WINAPI WimUnmountImageThread(LPVOID param)
 
 	progress_report_mask = WIM_REPORT_PROGRESS;
 	progress_op = OP_PATCH;
-	progress_msg = MSG_324;
+	progress_msg = MSG_325;
 	progress_offset = 105;
 	progress_total = PATCH_PROGRESS_TOTAL;
 	if (pfWIMRegisterMessageCallback(NULL, (FARPROC)WimProgressCallback, NULL) == INVALID_CALLBACK_VALUE) {
@@ -613,17 +474,17 @@ static DWORD WINAPI WimUnmountImageThread(LPVOID param)
 		goto out;
 	}
 
-	r = pfWIMUnmountImage(wmount_path, wimage, _index, TRUE);
+	r = pfWIMUnmountImage(wmount_path, wimage, mp->index, mp->commit);
 	pfWIMUnregisterMessageCallback(NULL, (FARPROC)WimProgressCallback);
 	if (!r) {
 		uprintf("Could not unmount '%S': %s", wmount_path, WindowsErrorString());
 		goto out;
 	}
-	uprintf("Unmounted '%S [%d]'", wmount_path, _index);
-	if (!RemoveDirectoryW(wmount_track))
+	uprintf("Unmounted '%S [%d]'", wmount_path, mp->index);
+	if (wmount_track[0] != 0 && !RemoveDirectoryW(wmount_track))
 		uprintf("Could not delete '%S' : %s", wmount_track, WindowsErrorString());
 	wmount_track[0] = 0;
-	if (!RemoveDirectoryW(wmount_path))
+	if (wmount_path[0] != 0 && !RemoveDirectoryW(wmount_path))
 		uprintf("Could not delete '%S' : %s", wmount_path, WindowsErrorString());
 	wmount_path[0] = 0;
 out:
@@ -631,13 +492,15 @@ out:
 	ExitThread((DWORD)r);
 }
 
-BOOL WimUnmountImage(const char* image, int index)
+BOOL WimUnmountImage(const char* image, int index, BOOL commit)
 {
 	DWORD dw = 0;
-	_image = image;
-	_index = index;
+	mount_params_t mp = { 0 };
+	mp.image = image;
+	mp.index = index;
+	mp.commit = commit;
 
-	wim_thread = CreateThread(NULL, 0, WimUnmountImageThread, NULL, 0, NULL);
+	wim_thread = CreateThread(NULL, 0, WimUnmountImageThread, &mp, 0, NULL);
 	if (wim_thread == NULL) {
 		uprintf("Unable to start unmount-image thread");
 		return FALSE;
@@ -650,7 +513,59 @@ BOOL WimUnmountImage(const char* image, int index)
 	return dw;
 }
 
-// Extract a file from a WIM image using wimgapi.dll (Windows 7 or later)
+// Get the existing mount point (if any) for the image + index passed as parameters.
+// Needed because Windows refuses to mount two images with the same path/index even
+// if the previous has become stale or deleted. This situation may occur if the user
+// force-closed Rufus when 'boot.wim' was mounted, thus leaving them unable to mount
+// 'boot.wim' for subsequent sessions unless they invoke dism /Unmount-Wim manually.
+// This basically parses HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\WIMMount\Mounted Images
+// to see if an instance exists with the image/index passed as parameter and returns
+// the mount point of this image if found, or NULL otherwise.
+char* WimGetExistingMountPoint(const char* image, int index)
+{
+	static char path[MAX_PATH];
+	char class[MAX_PATH] = "", guid[40], key_name[MAX_PATH];
+	HKEY hKey;
+	DWORD dw = 0, i, k, nb_subkeys = 0, class_size;
+	DWORD cbMaxSubKey, cchMaxClass, cValues, cchMaxValue;
+	DWORD cbMaxValueData, cbSecurityDescriptor;
+	FILETIME ftLastWriteTime;
+
+	if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\WIMMount\\Mounted Images",
+		0, KEY_READ, &hKey) != ERROR_SUCCESS)
+		return NULL;
+
+	class_size = sizeof(class);
+	RegQueryInfoKeyA(hKey, class, &class_size, NULL, &nb_subkeys,
+		&cbMaxSubKey, &cchMaxClass, &cValues, &cchMaxValue,
+		&cbMaxValueData, &cbSecurityDescriptor, &ftLastWriteTime);
+
+	for (k = 0; k < nb_subkeys; k++) {
+		dw = sizeof(guid);
+		if (RegEnumKeyExA(hKey, k, guid, &dw, NULL, NULL, NULL,
+			&ftLastWriteTime) == ERROR_SUCCESS) {
+			static_sprintf(key_name, "SOFTWARE\\Microsoft\\WIMMount\\Mounted Images\\%s\\WIM Path", guid);
+			if (GetRegistryKeyStr(HKEY_LOCAL_MACHINE, key_name, path, sizeof(path)) &&
+				(stricmp(path, image) != 0))
+				continue;
+			static_sprintf(key_name, "SOFTWARE\\Microsoft\\WIMMount\\Mounted Images\\%s\\Image Index", guid);
+			if (GetRegistryKey32(HKEY_LOCAL_MACHINE, key_name, &i) && (i != (DWORD)index))
+				continue;
+			path[0] = 0;
+			static_sprintf(key_name, "SOFTWARE\\Microsoft\\WIMMount\\Mounted Images\\%s\\Mount Path", guid);
+			if (GetRegistryKeyStr(HKEY_LOCAL_MACHINE, key_name, path, sizeof(path)))
+				break;
+		}
+	}
+	if (k >= nb_subkeys)
+		path[0] = 0;
+
+	RegCloseKey(hKey);
+
+	return (path[0] == 0) ? NULL: path;
+}
+
+// Extract a file from a WIM image using wimgapi.dll
 // NB: if you want progress from a WIM callback, you must run the WIM API call in its own thread
 // (which we don't do here) as it won't work otherwise. Thanks go to Erwan for figuring this out!
 BOOL WimExtractFile_API(const char* image, int index, const char* src, const char* dst, BOOL bSilent)
@@ -661,11 +576,11 @@ BOOL WimExtractFile_API(const char* image, int index, const char* src, const cha
 	HANDLE hWim = NULL;
 	HANDLE hImage = NULL;
 	HANDLE hFile = NULL;
-	wchar_t wtemp[MAX_PATH] = {0};
+	wchar_t wtemp[MAX_PATH] = { 0 };
 	wchar_t* wimage = utf8_to_wchar(image);
 	wchar_t* wsrc = utf8_to_wchar(src);
 	wchar_t* wdst = utf8_to_wchar(dst);
-	char* wim_info;
+	wchar_t* wim_info;
 
 	PF_INIT_OR_OUT(WIMCreateFile, Wimgapi);
 	PF_INIT_OR_OUT(WIMSetTemporaryPath, Wimgapi);
@@ -697,7 +612,7 @@ BOOL WimExtractFile_API(const char* image, int index, const char* src, const cha
 
 	suprintf("Extracting: %s (From %s)", dst, src);
 	if (safe_strcmp(src, index_name) == 0) {
-		if (!pfWIMGetImageInformation(hWim, &wim_info, &dw)) {
+		if (!pfWIMGetImageInformation(hWim, &wim_info, &dw) || (dw == 0)) {
 			uprintf("  Could not access WIM info: %s", WindowsErrorString());
 			goto out;
 		}
@@ -807,7 +722,73 @@ BOOL WimExtractFile(const char* image, int index, const char* src, const char* d
 		  || ((wim_flags & WIM_HAS_API_EXTRACT) && WimExtractFile_API(image, index, src, dst, bSilent)) );
 }
 
-// Apply a WIM image using wimgapi.dll (Windows 7 or later)
+/// <summary>
+/// Find if a specific index belongs to a WIM image.
+/// </summary>
+/// <param name="image">The path to the WIM file.</param>
+/// <param name="index">The (non-zero) value of the index to check.</param>
+/// <returns>TRUE if the index was found in the image, FALSE otherwise.</returns>
+BOOL WimIsValidIndex(const char* image, int index)
+{
+	int i = 1, cur_index;
+	BOOL r = FALSE;
+	DWORD dw = 0;
+	HANDLE hWim = NULL;
+	HANDLE hFile = NULL;
+	char xml_file[MAX_PATH] = { 0 };
+	char* str;
+	wchar_t* wimage = utf8_to_wchar(image);
+	wchar_t* wim_info;
+
+	PF_INIT_OR_OUT(WIMCreateFile, Wimgapi);
+	PF_INIT_OR_OUT(WIMGetImageInformation, Wimgapi);
+	PF_INIT_OR_OUT(WIMCloseHandle, Wimgapi);
+
+	// Zero indexes are invalid
+	if (index == 0)
+		goto out;
+
+	hWim = pfWIMCreateFile(wimage, WIM_GENERIC_READ, WIM_OPEN_EXISTING,
+		(img_report.wininst_version >= SPECIAL_WIM_VERSION) ? WIM_UNDOCUMENTED_BULLSHIT : 0, 0, NULL);
+	if (hWim == NULL) {
+		uprintf("  Could not access image: %s", WindowsErrorString());
+		goto out;
+	}
+
+	if (!pfWIMGetImageInformation(hWim, &wim_info, &dw) || (dw == 0)) {
+		uprintf("  Could not access WIM info: %s", WindowsErrorString());
+		goto out;
+	}
+
+	if ((GetTempFileNameU(temp_dir, APPLICATION_NAME, 0, xml_file) == 0) || (xml_file[0] == 0))
+		static_strcpy(xml_file, ".\\RufVXml.tmp");
+	DeleteFileU(xml_file);
+	hFile = CreateFileU(xml_file, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+		NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if ((hFile == INVALID_HANDLE_VALUE) || (!WriteFile(hFile, wim_info, dw, &dw, NULL)))
+		goto out;
+
+	while ((str = get_token_data_file_indexed("IMAGE INDEX", xml_file, i)) != NULL) {
+		cur_index = atoi(str);
+		safe_free(str);
+		if (cur_index == index) {
+			r = TRUE;
+			break;
+		}
+		i++;
+	}
+
+out:
+	if (hWim != NULL)
+		pfWIMCloseHandle(hWim);
+	safe_closehandle(hFile);
+	if (xml_file[0] != 0)
+		DeleteFileU(xml_file);
+	safe_free(wimage);
+	return r;
+}
+
+// Apply a WIM image using wimgapi.dll
 // https://docs.microsoft.com/en-us/previous-versions/msdn10/dd851944(v=msdn.10)
 // To get progress, we must run this call within its own thread
 static DWORD WINAPI WimApplyImageThread(LPVOID param)
@@ -815,9 +796,10 @@ static DWORD WINAPI WimApplyImageThread(LPVOID param)
 	BOOL r = FALSE;
 	HANDLE hWim = NULL;
 	HANDLE hImage = NULL;
-	wchar_t wtemp[MAX_PATH] = {0};
-	wchar_t* wimage = utf8_to_wchar(_image);
-	wchar_t* wdst = utf8_to_wchar(_dst);
+	wchar_t wtemp[MAX_PATH] = { 0 };
+	mount_params_t* mp = (mount_params_t*)param;
+	wchar_t* wimage = utf8_to_wchar(mp->image);
+	wchar_t* wdst = utf8_to_wchar(mp->dst);
 
 	PF_INIT_OR_OUT(WIMRegisterMessageCallback, Wimgapi);
 	PF_INIT_OR_OUT(WIMCreateFile, Wimgapi);
@@ -827,7 +809,7 @@ static DWORD WINAPI WimApplyImageThread(LPVOID param)
 	PF_INIT_OR_OUT(WIMCloseHandle, Wimgapi);
 	PF_INIT_OR_OUT(WIMUnregisterMessageCallback, Wimgapi);
 
-	uprintf("Opening: %s:[%d]", _image, _index);
+	uprintf("Opening: %s:[%d]", mp->image, mp->index);
 
 	progress_report_mask = WIM_REPORT_PROCESS | WIM_REPORT_FILEINFO;
 	progress_op = OP_FILE_COPY;
@@ -856,7 +838,7 @@ static DWORD WINAPI WimApplyImageThread(LPVOID param)
 		goto out;
 	}
 
-	hImage = pfWIMLoadImage(hWim, (DWORD)_index);
+	hImage = pfWIMLoadImage(hWim, (DWORD)mp->index);
 	if (hImage == NULL) {
 		uprintf("  Could not set index: %s", WindowsErrorString());
 		goto out;
@@ -895,7 +877,7 @@ static DWORD WINAPI WimApplyImageThread(LPVOID param)
 
 out:
 	if ((hImage != NULL) || (hWim != NULL)) {
-		uprintf("Closing: %s", _image);
+		uprintf("Closing: %s", mp->image);
 		if (hImage != NULL) pfWIMCloseHandle(hImage);
 		if (hWim != NULL) pfWIMCloseHandle(hWim);
 	}
@@ -909,11 +891,12 @@ out:
 BOOL WimApplyImage(const char* image, int index, const char* dst)
 {
 	DWORD dw = 0;
-	_image = image;
-	_index = index;
-	_dst = dst;
+	mount_params_t mp = { 0 };
+	mp.image = image;
+	mp.index = index;
+	mp.dst = dst;
 
-	wim_thread = CreateThread(NULL, 0, WimApplyImageThread, NULL, 0, NULL);
+	wim_thread = CreateThread(NULL, 0, WimApplyImageThread, &mp, 0, NULL);
 	if (wim_thread == NULL) {
 		uprintf("Unable to start apply-image thread");
 		return FALSE;
@@ -924,4 +907,290 @@ BOOL WimApplyImage(const char* image, int index, const char* dst)
 		dw = 0;
 	wim_thread = NULL;
 	return dw;
+}
+
+// Mount an ISO or a VHD/VHDX image and provide its size
+// Returns the physical path of the mounted image or NULL on error.
+char* VhdMountImageAndGetSize(const char* path, uint64_t* disk_size)
+{
+	VIRTUAL_STORAGE_TYPE vtype = { VIRTUAL_STORAGE_TYPE_DEVICE_ISO, VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT };
+	ATTACH_VIRTUAL_DISK_PARAMETERS vparams = { 0 };
+	GET_VIRTUAL_DISK_INFO disk_info = { 0 };
+	DWORD r;
+	wchar_t wtmp[128];
+	ULONG size = ARRAYSIZE(wtmp);
+	wconvert(path);
+	char *ret = NULL, *ext = NULL;
+
+	if (wpath == NULL)
+		return NULL;
+
+	if ((mounted_handle != NULL) && (mounted_handle != INVALID_HANDLE_VALUE))
+		VhdUnmountImage();
+
+	if (safe_strlen(path) > 4)
+		for (ext = (char*)&path[safe_strlen(path) - 1]; (*ext != '.') && (ext != path); ext--);
+	if (safe_stricmp(ext, ".vhdx") == 0)
+		vtype.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;
+	else if (safe_stricmp(ext, ".vhd") == 0)
+		vtype.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_VHD;
+
+	r = OpenVirtualDisk(&vtype, wpath, VIRTUAL_DISK_ACCESS_READ | VIRTUAL_DISK_ACCESS_GET_INFO,
+		OPEN_VIRTUAL_DISK_FLAG_NONE, NULL, &mounted_handle);
+	if (r != ERROR_SUCCESS) {
+		SetLastError(r);
+		uprintf("Could not open image '%s': %s", path, WindowsErrorString());
+		goto out;
+	}
+
+	vparams.Version = ATTACH_VIRTUAL_DISK_VERSION_1;
+	r = AttachVirtualDisk(mounted_handle, NULL, ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY |
+		ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER, 0, &vparams, NULL);
+	if (r != ERROR_SUCCESS) {
+		SetLastError(r);
+		uprintf("Could not mount image '%s': %s", path, WindowsErrorString());
+		goto out;
+	}
+
+	r = GetVirtualDiskPhysicalPath(mounted_handle, &size, wtmp);
+	if (r != ERROR_SUCCESS) {
+		SetLastError(r);
+		uprintf("Could not obtain physical path for mounted image '%s': %s", path, WindowsErrorString());
+		goto out;
+	}
+	wchar_to_utf8_no_alloc(wtmp, physical_path, sizeof(physical_path));
+
+	if (disk_size != NULL) {
+		*disk_size = 0;
+		disk_info.Version = GET_VIRTUAL_DISK_INFO_SIZE;
+		size = sizeof(disk_info);
+		r = GetVirtualDiskInformation(mounted_handle, &size, &disk_info, NULL);
+		if (r != ERROR_SUCCESS) {
+			SetLastError(r);
+			uprintf("Could not obtain virtual size of mounted image '%s': %s", path, WindowsErrorString());
+			goto out;
+		}
+		*disk_size = disk_info.Size.VirtualSize;
+	}
+
+	ret = physical_path;
+
+out:
+	if (ret == NULL)
+		VhdUnmountImage();
+	wfree(path);
+	return ret;
+}
+
+void VhdUnmountImage(void)
+{
+	if ((mounted_handle == NULL) || (mounted_handle == INVALID_HANDLE_VALUE))
+		goto out;
+
+	DetachVirtualDisk(mounted_handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+	safe_closehandle(mounted_handle);
+out:
+	physical_path[0] = 0;
+}
+
+// Since we no longer have to deal with Windows 7, we can call on CreateVirtualDisk()
+// to backup a physical disk to VHD/VHDX. Now if this could also be used to create an
+// ISO from optical media that would be swell, but no matter what I tried, it didn't
+// seem possible...
+static DWORD WINAPI VhdSaveImageThread(void* param)
+{
+	IMG_SAVE* img_save = (IMG_SAVE*)param;
+	HANDLE handle = INVALID_HANDLE_VALUE;
+	WCHAR* wSrc = utf8_to_wchar(img_save->DevicePath);
+	WCHAR* wDst = utf8_to_wchar(img_save->ImagePath);
+	VIRTUAL_STORAGE_TYPE vtype = { img_save->Type, VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT };
+	STOPGAP_CREATE_VIRTUAL_DISK_PARAMETERS vparams = { 0 };
+	VIRTUAL_DISK_PROGRESS vprogress = { 0 };
+	OVERLAPPED overlapped = { 0 };
+	DWORD r = ERROR_NOT_FOUND, flags;
+
+	if_not_assert(img_save->Type == VIRTUAL_STORAGE_TYPE_DEVICE_VHD ||
+		img_save->Type == VIRTUAL_STORAGE_TYPE_DEVICE_VHDX)
+		return ERROR_INVALID_PARAMETER;
+
+	UpdateProgressWithInfoInit(NULL, FALSE);
+
+	vparams.Version = CREATE_VIRTUAL_DISK_VERSION_2;
+	vparams.Version2.UniqueId = GUID_NULL;
+	vparams.Version2.BlockSizeInBytes = CREATE_VIRTUAL_DISK_PARAMETERS_DEFAULT_BLOCK_SIZE;
+	vparams.Version2.SectorSizeInBytes = CREATE_VIRTUAL_DISK_PARAMETERS_DEFAULT_SECTOR_SIZE;
+	vparams.Version2.PhysicalSectorSizeInBytes = SelectedDrive.SectorSize;
+	vparams.Version2.SourcePath = wSrc;
+
+	// When CREATE_VIRTUAL_DISK_FLAG_CREATE_BACKING_STORAGE is specified with
+	// a source path, CreateVirtualDisk() automatically clones the source to
+	// the virtual disk.
+	flags = CREATE_VIRTUAL_DISK_FLAG_CREATE_BACKING_STORAGE;
+	// The following ensures that VHD images are stored uncompressed and can
+	// be used as DD images.
+	if (img_save->Type == VIRTUAL_STORAGE_TYPE_DEVICE_VHD)
+		flags |= CREATE_VIRTUAL_DISK_FLAG_FULL_PHYSICAL_ALLOCATION;
+	// TODO: Use CREATE_VIRTUAL_DISK_FLAG_PREVENT_WRITES_TO_SOURCE_DISK?
+
+	overlapped.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+
+	// CreateVirtualDisk() does not have an overwrite flag...
+	DeleteFileW(wDst);
+
+	r = CreateVirtualDisk(&vtype, wDst, VIRTUAL_DISK_ACCESS_NONE, NULL,
+		flags, 0, (PCREATE_VIRTUAL_DISK_PARAMETERS)&vparams, &overlapped, &handle);
+	if (r != ERROR_SUCCESS && r != ERROR_IO_PENDING) {
+		SetLastError(r);
+		uprintf("Could not create virtual disk: %s", WindowsErrorString());
+		goto out;
+	}
+
+	if (r == ERROR_IO_PENDING) {
+		while ((r = WaitForSingleObject(overlapped.hEvent, 100)) == WAIT_TIMEOUT) {
+			if (IS_ERROR(ErrorStatus) && (SCODE_CODE(ErrorStatus) == ERROR_CANCELLED)) {
+				CancelIoEx(handle, &overlapped);
+				goto out;
+			}
+			if (GetVirtualDiskOperationProgress(handle, &overlapped, &vprogress) == ERROR_SUCCESS) {
+				if (vprogress.OperationStatus == ERROR_IO_PENDING)
+					UpdateProgressWithInfo(OP_FORMAT, MSG_261, vprogress.CurrentValue, vprogress.CompletionValue);
+			}
+		}
+		if (r != WAIT_OBJECT_0) {
+			uprintf("Could not save virtual disk: %s", WindowsErrorString());
+			goto out;
+		}
+	}
+
+	r = 0;
+	UpdateProgressWithInfo(OP_FORMAT, MSG_261, SelectedDrive.DiskSize, SelectedDrive.DiskSize);
+	uprintf("Saved '%s'", img_save->ImagePath);
+
+out:
+	safe_closehandle(overlapped.hEvent);
+	safe_closehandle(handle);
+	safe_free(wSrc);
+	safe_free(wDst);
+	safe_free(img_save->DevicePath);
+	safe_free(img_save->ImagePath);
+	PostMessage(hMainDialog, UM_FORMAT_COMPLETED, (WPARAM)TRUE, 0);
+	ExitThread(r);
+}
+
+// FfuProvider.dll has some nice FfuApplyImage()/FfuCaptureImage() calls... which
+// Microsoft decided not make public!
+// Considering that trying to both figure out how to use these internal function
+// calls, as well as how to properly hook into the DLL for every arch/every release
+// of Windows, would be a massive timesink, we just take a shortcut by calling dism
+// directly, as imperfect as such a solution might be...
+static DWORD WINAPI FfuSaveImageThread(void* param)
+{
+	DWORD r;
+	IMG_SAVE* img_save = (IMG_SAVE*)param;
+	char cmd[MAX_PATH + 128], letters[27], *label;
+
+	GetDriveLabel(SelectedDrive.DeviceNumber, letters, &label, TRUE);
+	static_sprintf(cmd, "dism /Capture-Ffu /CaptureDrive:%s /ImageFile:\"%s\" "
+		"/Name:\"%s\" /Description:\"Created by %s (%s)\"",
+		img_save->DevicePath, img_save->ImagePath, label, APPLICATION_NAME, RUFUS_URL);
+	uprintf("Running command: '%s", cmd);
+	r = RunCommandWithProgress(cmd, sysnative_dir, TRUE, MSG_261);
+	if (r != 0 && !IS_ERROR(ErrorStatus)) {
+		SetLastError(r);
+		uprintf("Failed to capture FFU image: %s", WindowsErrorString());
+		ErrorStatus = RUFUS_ERROR(SCODE_CODE(r));
+	}
+	safe_free(img_save->DevicePath);
+	safe_free(img_save->ImagePath);
+	PostMessage(hMainDialog, UM_FORMAT_COMPLETED, (WPARAM)TRUE, 0);
+	if (!IS_ERROR(ErrorStatus))
+		uprintf("Saved '%s'", img_save->ImagePath);
+	ExitThread(r);
+}
+
+void VhdSaveImage(void)
+{
+	UINT i;
+	static IMG_SAVE img_save;
+	char filename[128];
+	char path[MAX_PATH];
+	int DriveIndex = ComboBox_GetCurSel(hDeviceList);
+	enum { image_type_vhd = 1, image_type_vhdx = 2, image_type_ffu = 3 };
+	static EXT_DECL(img_ext, filename, __VA_GROUP__("*.vhd", "*.vhdx", "*.ffu"),
+		__VA_GROUP__(lmprintf(MSG_343), lmprintf(MSG_342), lmprintf(MSG_344)));
+	ULARGE_INTEGER free_space;
+
+	memset(&img_save, 0, sizeof(IMG_SAVE));
+	if ((DriveIndex < 0) || (format_thread != NULL))
+		return;
+
+	static_sprintf(filename, "%s", rufus_drive[DriveIndex].label);
+	img_save.DeviceNum = (DWORD)ComboBox_GetItemData(hDeviceList, DriveIndex);
+	img_save.DevicePath = GetPhysicalName(img_save.DeviceNum);
+	// FFU support requires GPT
+	img_ext.count = (!has_ffu_support || SelectedDrive.PartitionStyle != PARTITION_STYLE_GPT) ? 2 : 3;
+	for (i = 1; i <= (UINT)img_ext.count && (safe_strcmp(save_image_type , &_img_ext_x[i - 1][2]) != 0); i++);
+	if (i > (UINT)img_ext.count)
+		i = image_type_vhdx;
+	img_save.ImagePath = FileDialog(TRUE, NULL, &img_ext, &i);
+	if (img_save.ImagePath == NULL)
+		goto out;
+	// Start from the end of our extension array, since '.vhd' would match for '.vhdx' otherwise
+	for (i = (UINT)img_ext.count; (i > 0) && (strstr(img_save.ImagePath, &_img_ext_x[i - 1][1]) == NULL); i--);
+	if (i == 0) {
+		uprintf("Warning: Can not determine image type from extension - Saving to uncompressed VHD.");
+		i = image_type_vhd;
+	} else {
+		save_image_type = (char*)&_img_ext_x[i - 1][2];
+		WriteSettingStr(SETTING_PREFERRED_SAVE_IMAGE_TYPE, save_image_type);
+	}
+	switch (i) {
+	case image_type_vhd:
+		img_save.Type = VIRTUAL_STORAGE_TYPE_DEVICE_VHD;
+		break;
+	case image_type_ffu:
+		img_save.Type = VIRTUAL_STORAGE_TYPE_DEVICE_FFU;
+		break;
+	default:
+		img_save.Type = VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;
+		break;
+	}
+	img_save.BufSize = DD_BUFFER_SIZE;
+	img_save.DeviceSize = SelectedDrive.DiskSize;
+	if (img_save.DevicePath != NULL && img_save.ImagePath != NULL) {
+		// Reset all progress bars
+		SendMessage(hMainDialog, UM_PROGRESS_INIT, 0, 0);
+		ErrorStatus = 0;
+		if (img_save.Type == VIRTUAL_STORAGE_TYPE_DEVICE_VHD) {
+			free_space.QuadPart = 0;
+			if ((GetVolumePathNameA(img_save.ImagePath, path, sizeof(path)))
+				&& (GetDiskFreeSpaceExA(path, &free_space, NULL, NULL))
+				&& ((LONGLONG)free_space.QuadPart < (SelectedDrive.DiskSize + 512))) {
+				uprintf("The VHD size is too large for the target drive");
+				ErrorStatus = RUFUS_ERROR(ERROR_FILE_TOO_LARGE);
+				PostMessage(hMainDialog, UM_FORMAT_COMPLETED, (WPARAM)FALSE, 0);
+				goto out;
+			}
+		}
+		// Disable all controls except Cancel
+		EnableControls(FALSE, FALSE);
+		ErrorStatus = 0;
+		InitProgress(TRUE);
+		format_thread = CreateThread(NULL, 0, img_save.Type == VIRTUAL_STORAGE_TYPE_DEVICE_FFU ?
+			FfuSaveImageThread : VhdSaveImageThread, &img_save, 0, NULL);
+		if (format_thread != NULL) {
+			uprintf("\r\nSave to VHD operation started");
+			PrintInfo(0, -1);
+			SendMessage(hMainDialog, UM_TIMER_START, 0, 0);
+		} else {
+			uprintf("Unable to start VHD save thread");
+			ErrorStatus = RUFUS_ERROR(APPERR(ERROR_CANT_START_THREAD));
+			PostMessage(hMainDialog, UM_FORMAT_COMPLETED, (WPARAM)FALSE, 0);
+		}
+	}
+out:
+	if (format_thread == NULL) {
+		safe_free(img_save.DevicePath);
+		safe_free(img_save.ImagePath);
+	}
 }

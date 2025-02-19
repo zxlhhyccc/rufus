@@ -6,7 +6,7 @@
  *
  * See also: https://utf8everywhere.org
  *
- * Copyright © 2010-2021 Pete Batard <pete@akeo.ie>
+ * Copyright © 2010-2025 Pete Batard <pete@akeo.ie>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -26,6 +26,8 @@
 #include <stdio.h>
 #include <shlobj.h>
 #include <ctype.h>
+#include <aclapi.h>
+#include <accctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shlwapi.h>
@@ -88,6 +90,9 @@ static __inline char* wchar_to_utf8(const wchar_t* wstr)
 {
 	int size = 0;
 	char* str = NULL;
+
+	if (wstr == NULL)
+		return NULL;
 
 	// Convert the empty string too
 	if (wstr[0] == 0)
@@ -169,14 +174,24 @@ static __inline DWORD FormatMessageU(DWORD dwFlags, LPCVOID lpSource, DWORD dwMe
 									 DWORD dwLanguageId, char* lpBuffer, DWORD nSize, va_list *Arguments)
 {
 	DWORD ret = 0, err = ERROR_INVALID_DATA;
-	// coverity[returned_null]
+	// Exclude support for the FORMAT_MESSAGE_ALLOCATE_BUFFER special case.
+	if (dwFlags & FORMAT_MESSAGE_ALLOCATE_BUFFER) {
+		SetLastError(ERROR_INVALID_PARAMETER);
+		return 0;
+	}
 	walloc(lpBuffer, nSize);
+	if (wlpBuffer == NULL) {
+		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+		return 0;
+	}
 	ret = FormatMessageW(dwFlags, lpSource, dwMessageId, dwLanguageId, wlpBuffer, nSize, Arguments);
 	err = GetLastError();
 	if ((ret != 0) && ((ret = wchar_to_utf8_no_alloc(wlpBuffer, lpBuffer, nSize)) == 0)) {
 		err = GetLastError();
 		ret = 0;
 	}
+	// Coverity doesn't realise that we filtered out the FORMAT_MESSAGE_ALLOCATE_BUFFER case
+	// coverity[leaked_storage]
 	wfree(lpBuffer);
 	SetLastError(err);
 	return ret;
@@ -344,19 +359,19 @@ static __inline int DrawTextU(HDC hDC, LPCSTR lpText, int nCount, LPRECT lpRect,
 static __inline int GetWindowTextU(HWND hWnd, char* lpString, int nMaxCount)
 {
 	int ret = 0;
-	DWORD err = ERROR_INVALID_DATA;
+	DWORD err = ERROR_INVALID_PARAMETER;
+	if (lpString == NULL || nMaxCount < 1)
+		goto out;
 	// Handle the empty string as GetWindowTextW() returns 0 then
-	if ((lpString != NULL) && (nMaxCount > 0))
-		lpString[0] = 0;
-	// coverity[returned_null]
+	lpString[0] = 0;
 	walloc(lpString, nMaxCount);
 	ret = GetWindowTextW(hWnd, wlpString, nMaxCount);
 	err = GetLastError();
-	// coverity[var_deref_model]
-	if ( (ret != 0) && ((ret = wchar_to_utf8_no_alloc(wlpString, lpString, nMaxCount)) == 0) ) {
+	if ((ret != 0) && ((ret = wchar_to_utf8_no_alloc(wlpString, lpString, nMaxCount)) == 0))
 		err = GetLastError();
-	}
 	wfree(lpString);
+	lpString[nMaxCount - 1] = 0;
+out:
 	SetLastError(err);
 	return ret;
 }
@@ -568,6 +583,52 @@ static __inline const char* PathFindFileNameU(const char* szPath)
 	return &szPath[i];
 }
 
+static __inline char* PathCombineU(char* lpDest, char* lpDir, char* lpFile)
+{
+	wchar_t* wret = NULL;
+	DWORD err = ERROR_INVALID_DATA;
+	wchar_t wlpDest[MAX_PATH];
+	wconvert(lpDir);
+	wconvert(lpFile);
+	wret = PathCombineW(wlpDest, wlpDir, wlpFile);
+	err = GetLastError();
+	wfree(lpDir);
+	wfree(lpFile);
+	if (wret == NULL)
+		return NULL;
+	wchar_to_utf8_no_alloc(wlpDest, lpDest, MAX_PATH);
+	SetLastError(err);
+	return lpDest;
+}
+
+static __inline HANDLE FindFirstFileU(char* lpFileName, LPWIN32_FIND_DATAA lpFindFileData)
+{
+	HANDLE ret = INVALID_HANDLE_VALUE;
+	WIN32_FIND_DATAW wFindFileData = { 0 };
+	wconvert(lpFileName);
+	ret = FindFirstFileW(wlpFileName, &wFindFileData);
+	if (ret != INVALID_HANDLE_VALUE) {
+		memcpy(lpFindFileData, &wFindFileData, offsetof(WIN32_FIND_DATAW, cFileName));
+		wchar_to_utf8_no_alloc(wFindFileData.cFileName, lpFindFileData->cFileName, sizeof(lpFindFileData->cFileName));
+		wchar_to_utf8_no_alloc(wFindFileData.cAlternateFileName, lpFindFileData->cAlternateFileName, sizeof(lpFindFileData->cAlternateFileName));
+	}
+	wfree(lpFileName);
+	return ret;
+}
+
+static __inline BOOL FindNextFileU(HANDLE hFindFile, LPWIN32_FIND_DATAA lpFindFileData)
+{
+	BOOL ret = FALSE;
+	WIN32_FIND_DATAW wFindFileData = { 0 };
+	ret = FindNextFileW(hFindFile, &wFindFileData);
+	if (ret) {
+		memcpy(lpFindFileData, &wFindFileData, offsetof(WIN32_FIND_DATAW, cFileName));
+		wchar_to_utf8_no_alloc(wFindFileData.cFileName, lpFindFileData->cFileName, sizeof(lpFindFileData->cFileName));
+		wchar_to_utf8_no_alloc(wFindFileData.cAlternateFileName, lpFindFileData->cAlternateFileName, sizeof(lpFindFileData->cAlternateFileName));
+	}
+	return ret;
+}
+
 // This function differs from regular GetTextExtentPoint in that it uses a zero terminated string
 static __inline BOOL GetTextExtentPointU(HDC hdc, const char* lpString, LPSIZE lpSize)
 {
@@ -720,6 +781,21 @@ static __inline DWORD GetModuleFileNameExU(HANDLE hProcess, HMODULE hModule, cha
 	return ret;
 }
 
+static __inline DWORD GetFinalPathNameByHandleU(HANDLE hFile, char* lpszFilePath, DWORD cchFilePath, DWORD dwFlags)
+{
+	DWORD ret = 0, err = ERROR_INVALID_DATA;
+	walloc(lpszFilePath, cchFilePath);
+	ret = GetFinalPathNameByHandleW(hFile, wlpszFilePath, cchFilePath, dwFlags);
+	err = GetLastError();
+	if ((ret != 0)
+		&& ((ret = wchar_to_utf8_no_alloc(wlpszFilePath, lpszFilePath, cchFilePath)) == 0)) {
+		err = GetLastError();
+	}
+	wfree(lpszFilePath);
+	SetLastError(err);
+	return ret;
+}
+
 static __inline DWORD GetFileVersionInfoSizeU(const char* lpFileName, LPDWORD lpdwHandle)
 {
 	DWORD ret = 0, err = ERROR_INVALID_DATA;
@@ -804,6 +880,28 @@ static __inline BOOL SetFileAttributesU(const char* lpFileName, DWORD dwFileAttr
 	return ret;
 }
 
+static __inline DWORD GetNamedSecurityInfoU(const char* lpObjectName, SE_OBJECT_TYPE ObjectType,
+	SECURITY_INFORMATION SecurityInfo, PSID* ppsidOwner, PSID* ppsidGroup, PACL* ppDacl,
+	PACL* ppSacl, PSECURITY_DESCRIPTOR* ppSecurityDescriptor)
+{
+	DWORD ret;
+	wconvert(lpObjectName);
+	ret = GetNamedSecurityInfoW(wlpObjectName, ObjectType, SecurityInfo, ppsidOwner, ppsidGroup,
+		ppDacl, ppSacl, ppSecurityDescriptor);
+	wfree(lpObjectName);
+	return ret;
+}
+
+static __inline DWORD SetNamedSecurityInfoU(const char* lpObjectName, SE_OBJECT_TYPE ObjectType,
+	SECURITY_INFORMATION SecurityInfo, PSID psidOwner, PSID psidGroup, PACL pDacl, PACL pSacl)
+{
+	DWORD ret;
+	wconvert(lpObjectName);
+	ret = SetNamedSecurityInfoW(wlpObjectName, ObjectType, SecurityInfo, psidOwner, psidGroup, pDacl, pSacl);
+	wfree(lpObjectName);
+	return ret;
+}
+
 static __inline int SHCreateDirectoryExU(HWND hwnd, const char* pszPath, SECURITY_ATTRIBUTES *psa)
 {
 	int ret = ERROR_INVALID_DATA;
@@ -821,7 +919,7 @@ static __inline int SHDeleteDirectoryExU(HWND hwnd, const char* pszPath, FILEOP_
 	int ret;
 	// String needs to be double NULL terminated, so we just use the length of the UTF-8 string
 	// which is always expected to be larger than our UTF-16 one, and add 2 chars for good measure.
-	size_t wpszPath_len = strlen(pszPath) + 2;
+	size_t wpszPath_len = (pszPath == NULL) ? 0 : strlen(pszPath) + 2;
 	// coverity[returned_null]
 	walloc(pszPath, wpszPath_len);
 	SHFILEOPSTRUCTW shfo = { hwnd, FO_DELETE, wpszPath, NULL, fFlags, FALSE, NULL, NULL };
@@ -1131,6 +1229,13 @@ static __inline const char* _filenameU(const char* path)
 	return path;
 }
 
+static __inline uint64_t _filesizeU(const char* path)
+{
+	struct __stat64 stat64 = { 0 };
+	_stat64U(path, &stat64);
+	return stat64.st_size;
+}
+
 // returned UTF-8 string must be freed
 static __inline char* getenvU(const char* varname)
 {
@@ -1218,6 +1323,16 @@ static __inline BOOL MoveFileExU(const char* lpExistingFileName, const char* lpN
 	return ret;
 }
 
+static __inline BOOL CreateSymbolicLinkU(const char* lpSymlinkFileName, const char* lpTargetFileName, DWORD dwFlags)
+{
+	wconvert(lpSymlinkFileName);
+	wconvert(lpTargetFileName);
+	BOOL ret = CreateSymbolicLinkW(wlpSymlinkFileName, wlpTargetFileName, dwFlags);
+	wfree(lpTargetFileName);
+	wfree(lpSymlinkFileName);
+	return ret;
+}
+
 // The following expects PropertyBuffer to contain a single Unicode string
 static __inline BOOL SetupDiGetDeviceRegistryPropertyU(HDEVINFO DeviceInfoSet, PSP_DEVINFO_DATA DeviceInfoData,
 	DWORD Property, PDWORD PropertyRegDataType, PBYTE PropertyBuffer, DWORD PropertyBufferSize, PDWORD RequiredSize)
@@ -1236,6 +1351,33 @@ static __inline BOOL SetupDiGetDeviceRegistryPropertyU(HDEVINFO DeviceInfoSet, P
 		ret = FALSE;
 	}
 	wfree(PropertyBuffer);
+	SetLastError(err);
+	return ret;
+}
+
+// NB: This does not support the ERROR_INSUFFICIENT_BUFFER dance to retrieve the required buffer size
+static __inline BOOL GetUserNameU(LPSTR lpBuffer, LPDWORD pcbBuffer)
+{
+	BOOL ret;
+	DWORD err, size;
+	if (lpBuffer == NULL || pcbBuffer == NULL) {
+		SetLastError(ERROR_INVALID_PARAMETER);
+		return FALSE;
+	}
+	size = *pcbBuffer;
+	// coverity[returned_null]
+	walloc(lpBuffer, size);
+	ret = GetUserNameW(wlpBuffer, &size);
+	err = GetLastError();
+	if (ret) {
+		*pcbBuffer = (DWORD)wchar_to_utf8_no_alloc(wlpBuffer, lpBuffer, size);
+		if (*pcbBuffer == 0)
+			err = GetLastError();
+		else
+			// Reported size includes the NUL terminator
+			(*pcbBuffer)++;
+	}
+	wfree(lpBuffer);
 	SetLastError(err);
 	return ret;
 }
