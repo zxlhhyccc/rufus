@@ -159,6 +159,7 @@ CFLAGS = @CFLAGS@
 CPPFLAGS = @CPPFLAGS@
 CYGPATH_W = @CYGPATH_W@
 DEFS = @DEFS@
+DLLTOOL = @DLLTOOL@
 ECHO_C = @ECHO_C@
 ECHO_N = @ECHO_N@
 ECHO_T = @ECHO_T@
@@ -500,6 +501,9 @@ uninstall-am:
 	maintainer-clean-generic mostlyclean mostlyclean-generic pdf \
 	pdf-am ps ps-am tags tags-am uninstall uninstall-am
 
+
+upx: all
+	@upx --lzma --best src/$(TARGET)$(EXEEXT)
 
 # This step produces the UPX compressed and signed releases that are made available for public download
 # NB: UPX v3.09 or later is needed for LZMA compression (http://upx.sourceforge.net/)

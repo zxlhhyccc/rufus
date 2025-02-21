@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * SMART HDD vs Flash detection - isHDD() tables
- * Copyright © 2013-2021 Pete Batard <pete@akeo.ie>
+ * Copyright © 2013-2023 Pete Batard <pete@akeo.ie>
  *
  * Based in part on drivedb.h from Smartmontools:
  * http://svn.code.sf.net/p/smartmontools/code/trunk/smartmontools/drivedb.h
@@ -90,7 +90,11 @@ static str_score_t str_score[] = {
 static str_score_t str_adjust[] = {
 	{ "Gadget", -10 },
 	{ "Flash", -10 },
+	{ "SD-CARD", -10 },
+	{ "uSD Card", -10 },
 	{ "HDD", +20 },
+	{ "SATA", +20 },
+	{ "SCSI", +20 },
 	{ "SSD", +20 }
 };
 
@@ -256,6 +260,7 @@ static vidpid_score_t vidpid_score[] = {
 	{ 0x059f, 0x1027, -20 },	// 16 GB UFD
 	{ 0x059f, 0x103B, -20 },	// 16 GB UFD
 	{ 0x059f, 0x1064, -20 },	// 16 GB UFD
+	{ 0x059f, 0x1079, -20 },	// LaCie XtremKey UFD
 	// Apple exceptions
 	{ 0x05ac, 0x8400, -20},
 	{ 0x05ac, 0x8401, -20},
@@ -265,8 +270,6 @@ static vidpid_score_t vidpid_score[] = {
 	{ 0x05ac, 0x8405, -20},
 	{ 0x05ac, 0x8406, -20},
 	{ 0x05ac, 0x8407, -20},
-	// No idea who these guys are. They don't exist in usb.ids.
-	{ 0x6557, 0x0021, -5},
 	// Prolific exceptions
 	{ 0x067b, 0x2506, -20 },	// 8 GB Micro Hard Drive
 	{ 0x067b, 0x2517, -20 },	// 1 GB UFD
@@ -299,4 +302,8 @@ static vidpid_score_t vidpid_score[] = {
 	{ 0x18a5, 0x3327, -20 },
 	// More Innostor
 	{ 0x1f75, 0x0917, -10 },	// Intenso Speed Line USB Device
+	// ??? (https://github.com/pbatard/rufus/issues/2247)
+	{ 0x23a9, 0xef18, -10 },
+	// No idea who these guys are. They don't exist in usb.ids.
+	{ 0x6557, 0x0021, -5 },
 };
